@@ -53,7 +53,8 @@ def main():
         with st.form("report_form"):
             sector = st.selectbox("Sector", ["Centro", "Alerce", "Mirasol"])
             nivel = st.select_slider("Estado observado", options=["Transitable", "Precaución", "Inundado"])
-            submitted = st.form_submit_with_button("Enviar Reporte")
+            # Se corrigió a st.form_submit_button
+            submitted = st.form_submit_button("Enviar Reporte")
             if submitted:
                 st.success(f"Gracias, reporte para {sector} recibido.")
 
