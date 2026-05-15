@@ -1,0 +1,9 @@
+# requirements.txt
+streamlit
+pandas
+numpy
+openpyxl
+matplotlib
+gspread
+folium
+streamlit-folium
