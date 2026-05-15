@@ -2,85 +2,65 @@ import streamlit as st
 import pandas as pd
 import folium
 from streamlit_folium import st_folium
-import requests
 from datetime import datetime
+import gspread # Necesitarás configurar las credenciales de Google
+from oauth2client.service_account import ServiceAccountCredentials
 
-# Configuración de página
-st.set_page_config(page_title="AquaRuta - Puerto Montt", layout="wide")
-
-# Función para obtener datos reales de clima
-def get_weather_data(api_key):
-    city = "Puerto Montt"
-    url = f"http://api.openweathermap.org/data/2.5/weather?q={city}&appid={api_key}&units=metric&lang=es"
-    try:
-        response = requests.get(url)
-        return response.json()
-    except:
-        return None
+# 1. Configuración de la base de datos (Google Sheets)
+def get_data_from_gsheets():
+    # Solo como ejemplo de estructura, aquí leerías tu Google Sheet
+    # En un prototipo real, usarías gspread para traer los reportes
+    # Por ahora simulamos la "Base de datos" que se alimentaría de los reportes
+    data = {
+        'Sector': ['Centro', 'Alerce', 'Mirasol'],
+        'Lat': [-41.472, -41.400, -41.480],
+        'Lon': [-72.942, -72.900, -72.960],
+        'Nivel': ['Inundado', 'Precaución', 'Transitable'],
+        'Radio': [300, 500, 400] # Metros de la esfera/zona
+    }
+    return pd.DataFrame(data)
 
 def main():
-    st.title("💧 AquaRuta")
-    st.write("Visualización colaborativa con datos meteorológicos reales.")
+    st.set_page_config(page_title="AquaRuta Real-Time", layout="wide")
+    st.title("💧 AquaRuta: Monitoreo por Zonas")
 
-    # Simulación de API KEY (En producción usar st.secrets)
-    # Puedes obtener una gratis en openweathermap.org
-    API_KEY = "tu_api_key_aqui" 
-    weather = get_weather_data(API_KEY)
+    # Colores según nivel para las esferas
+    colores = {"Inundado": "red", "Precaución": "orange", "Transitable": "green"}
 
     col1, col2 = st.columns([3, 1])
 
     with col2:
-        if weather and weather.get("main"):
-            temp = weather["main"]["temp"]
-            desc = weather["weather"][0]["description"]
-            # Extraer lluvia en la última hora si existe
-            rain_1h = weather.get("rain", {}).get("1h", 0)
-            
-            st.metric("Lluvia (última hora)", f"{rain_1h} mm", delta="Intensa" if rain_1h > 2 else "Moderada")
-            st.write(f"🌡️ Temp: {temp}°C | ☁️ {desc.capitalize()}")
-            
-            # Lógica de riesgo automática según mm de lluvia
-            riesgo_auto = "Bajo"
-            if rain_1h > 5: riesgo_auto = "Crítico"
-            elif rain_1h > 1: riesgo_auto = "Medio"
-        else:
-            st.warning("No se pudo conectar con la API de clima. Usando datos simulados.")
-            rain_1h = 0.5
-            riesgo_auto = "Medio"
-
-        st.markdown("---")
-        st.subheader("📢 Reporte Ciudadano")
+        st.subheader("📍 Nuevo Reporte de Zona")
         with st.form("report_form"):
-            sector = st.selectbox("Sector", ["Centro", "Alerce", "Mirasol"])
-            nivel = st.select_slider("Estado observado", options=["Transitable", "Precaución", "Inundado"])
-            # Se corrigió a st.form_submit_button
-            submitted = st.form_submit_button("Enviar Reporte")
+            sector = st.selectbox("Seleccionar Sector", ["Centro", "Alerce", "Mirasol"])
+            estado = st.select_slider("Estado de la zona", options=["Transitable", "Precaución", "Inundado"])
+            # El usuario define qué tan grande es la afectación (la esfera)
+            radio_zona = st.slider("Radio de afectación (metros)", 100, 1000, 300)
+            
+            submitted = st.form_submit_button("Publicar en Mapa")
             if submitted:
-                st.success(f"Gracias, reporte para {sector} recibido.")
+                # Aquí iría el código: sheet.append_row([sector, estado, radio_zona, datetime.now()])
+                st.success(f"Zona {sector} actualizada en la base de datos.")
+                st.rerun() # Refresca la app para mostrar el nuevo dato
 
     with col1:
-        # Mapa base
-        m = folium.Map(location=[-41.4693, -72.9424], zoom_start=13, tiles="cartodbpositron")
+        df_reportes = get_data_from_gsheets()
+        
+        # Mapa centrado en Puerto Montt
+        m = folium.Map(location=[-41.4693, -72.9424], zoom_start=12, tiles="cartodbpositron")
 
-        # Puntos de interés basados en la lluvia real + diseño F11
-        puntos = [
-            {"loc": [-41.472, -72.942], "nombre": "Centro", "base_color": "red" if rain_1h > 3 else "orange"},
-            {"loc": [-41.400, -72.900], "nombre": "Alerce", "base_color": "red" if rain_1h > 5 else "green"},
-            {"loc": [-41.480, -72.960], "nombre": "Mirasol", "base_color": "orange" if rain_1h > 2 else "green"}
-        ]
-
-        for p in puntos:
-            folium.Marker(
-                location=p["loc"],
-                popup=f"{p['nombre']} - Riesgo: {p['base_color']}",
-                icon=folium.Icon(color=p["base_color"], icon="info-sign")
+        # Generar las esferas de riesgo en lugar de líneas de calle
+        for _, row in df_reportes.iterrows():
+            folium.Circle(
+                location=[row['Lat'], row['Lon']],
+                radius=row['Radio'],
+                color=colores[row['Nivel']],
+                fill=True,
+                fill_opacity=0.4,
+                popup=f"Sector: {row['Sector']}\nEstado: {row['Nivel']}"
             ).add_to(m)
 
-        # Dibujar Ruta Alternativa (F9: 3 zonas críticas)
-        ruta = [[-41.465, -72.930], [-41.468, -72.935], [-41.475, -72.945]]
-        folium.PolyLine(ruta, color="blue", weight=4, tooltip="Ruta Segura Sugerida").add_to(m)
-
-        st_folium(m, width=800, height=500)
+        st_folium(m, width=900, height=600)
 
 if __name__ == "__main__":
     main()
