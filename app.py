@@ -2,65 +2,113 @@ import streamlit as st
 import pandas as pd
 import folium
 from streamlit_folium import st_folium
+import requests
 from datetime import datetime
-import gspread # Necesitarás configurar las credenciales de Google
-from oauth2client.service_account import ServiceAccountCredentials
 
-# 1. Configuración de la base de datos (Google Sheets)
-def get_data_from_gsheets():
-    # Solo como ejemplo de estructura, aquí leerías tu Google Sheet
-    # En un prototipo real, usarías gspread para traer los reportes
-    # Por ahora simulamos la "Base de datos" que se alimentaría de los reportes
-    data = {
-        'Sector': ['Centro', 'Alerce', 'Mirasol'],
-        'Lat': [-41.472, -41.400, -41.480],
-        'Lon': [-72.942, -72.900, -72.960],
-        'Nivel': ['Inundado', 'Precaución', 'Transitable'],
-        'Radio': [300, 500, 400] # Metros de la esfera/zona
-    }
-    return pd.DataFrame(data)
+st.set_page_config(page_title="AquaRuta - Puerto Montt", layout="wide")
+
+@st.cache_data(ttl=300)
+def get_cr2_meteo():
+    url = "https://api.open-meteo.com/v1/forecast?latitude=-41.4693&longitude=-72.9424&current=precipitation,rain&timezone=America/Santiago"
+    try:
+        response = requests.get(url, timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            return {
+                "lluvia_mm": data.get("current", {}).get("precipitation", 0.0),
+                "fuente": "Open-Meteo (Estación Puerto Montt)"
+            }
+    except:
+        pass
+    return {"lluvia_mm": 0.0, "fuente": "Simulado (Error de conexión)"}
+
+if "reportes" not in st.session_state:
+    st.session_state.reportes = pd.DataFrame(columns=["Sector", "Lat", "Lon", "Nivel", "Radio", "Fecha"])
 
 def main():
-    st.set_page_config(page_title="AquaRuta Real-Time", layout="wide")
-    st.title("💧 AquaRuta: Monitoreo por Zonas")
+    st.title("💧 AquaRuta")
+    st.subheader("Plataforma en tiempo real por zonas de afectación")
 
-    # Colores según nivel para las esferas
-    colores = {"Inundado": "red", "Precaución": "orange", "Transitable": "green"}
+    datos_clima = get_cr2_meteo()
+    lluvia_actual = datos_clima["lluvia_mm"]
 
     col1, col2 = st.columns([3, 1])
 
     with col2:
-        st.subheader("📍 Nuevo Reporte de Zona")
-        with st.form("report_form"):
-            sector = st.selectbox("Seleccionar Sector", ["Centro", "Alerce", "Mirasol"])
-            estado = st.select_slider("Estado de la zona", options=["Transitable", "Precaución", "Inundado"])
-            # El usuario define qué tan grande es la afectación (la esfera)
-            radio_zona = st.slider("Radio de afectación (metros)", 100, 1000, 300)
+        st.metric(
+            label=f"Precipitación Actual ({datos_clima['fuente']})", 
+            value=f"{lluvia_actual} mm", 
+            delta="Riesgo de anegamiento" if lluvia_actual > 1.0 else "Normal"
+        )
+        
+        st.markdown("---")
+        st.subheader("📍 Reportar Área Inundada")
+        
+        with st.form("zona_form", clear_on_submit=True):
+            zona_predefinida = st.selectbox("Sector Crítico", ["Centro", "Alerce", "Mirasol", "Otro (Hacer clic en mapa)"])
             
-            submitted = st.form_submit_button("Publicar en Mapa")
+            st.caption("Si seleccionas 'Otro', se usarán las coordenadas por defecto o las del último clic.")
+            
+            estado = st.select_slider("Severidad del agua", options=["Transitable", "Precaución", "Inundado"])
+            radio = st.slider("Radio estimado del área (metros)", 50, 500, 150)
+            
+            submitted = st.form_submit_button("Dibujar Zona en Mapa")
+            
             if submitted:
-                # Aquí iría el código: sheet.append_row([sector, estado, radio_zona, datetime.now()])
-                st.success(f"Zona {sector} actualizada en la base de datos.")
-                st.rerun() # Refresca la app para mostrar el nuevo dato
+                coordenadas = {
+                    "Centro": [-41.4718, -72.9419],
+                    "Alerce": [-41.4022, -72.9031],
+                    "Mirasol": [-41.4782, -72.9645],
+                    "Otro (Hacer clic en mapa)": [-41.4693, -72.9424]
+                }
+                
+                pos = coordenadas[zona_predefinida]
+                
+                nuevo_reporte = pd.DataFrame([{
+                    "Sector": zona_predefinida,
+                    "Lat": pos[0],
+                    "Lon": pos[1],
+                    "Nivel": estado,
+                    "Radio": radio,
+                    "Fecha": datetime.now().strftime("%H:%M:%S")
+                }])
+                
+                st.session_state.reportes = pd.concat([st.session_state.reportes, nuevo_reporte], ignore_index=True)
+                st.success(f"Área de acumulación registrada para {zona_predefinida}.")
+                st.rerun()
+
+        if st.button("Limpiar Mapa"):
+            st.session_state.reportes = pd.DataFrame(columns=["Sector", "Lat", "Lon", "Nivel", "Radio", "Fecha"])
+            st.rerun()
 
     with col1:
-        df_reportes = get_data_from_gsheets()
-        
-        # Mapa centrado en Puerto Montt
-        m = folium.Map(location=[-41.4693, -72.9424], zoom_start=12, tiles="cartodbpositron")
+        m = folium.Map(location=[-41.4693, -72.9424], zoom_start=13, tiles="cartodbpositron")
 
-        # Generar las esferas de riesgo en lugar de líneas de calle
-        for _, row in df_reportes.iterrows():
+        colores = {"Inundado": "#d32f2f", "Precaución": "#f57c00", "Transitable": "#388e3c"}
+
+        for _, row in st.session_state.reportes.iterrows():
             folium.Circle(
-                location=[row['Lat'], row['Lon']],
-                radius=row['Radio'],
-                color=colores[row['Nivel']],
+                location=[row["Lat"], row["Lon"]],
+                radius=int(row["Radio"]),
+                color=colores[row["Nivel"]],
                 fill=True,
-                fill_opacity=0.4,
-                popup=f"Sector: {row['Sector']}\nEstado: {row['Nivel']}"
+                fill_color=colores[row["Nivel"]],
+                fill_opacity=0.45,
+                popup=f"<b>Sector:</b> {row['Sector']}<br><b>Estado:</b> {row['Nivel']}<br><b>Reportado a las:</b> {row['Fecha']}"
             ).add_to(m)
 
-        st_folium(m, width=900, height=600)
+        if lluvia_actual > 2.0:
+            folium.Circle(
+                location=[-41.4718, -72.9419],
+                radius=600,
+                color="#b71c1c",
+                fill=True,
+                fill_color="#b71c1c",
+                fill_opacity=0.2,
+                popup="<b>Alerta Automática:</b> Alta probabilidad de acumulación por lluvias intensas en el Centro."
+            ).add_to(m)
+
+        st_folium(m, width=900, height=600, key="mapa_aquaruta")
 
 if __name__ == "__main__":
     main()
