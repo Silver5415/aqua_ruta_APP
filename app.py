@@ -4,9 +4,65 @@ import folium
 from streamlit_folium import st_folium
 import requests
 from datetime import datetime
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+import os
 
 st.set_page_config(page_title="AquaRuta - Puerto Montt", layout="wide")
 
+# --- BASE DE DATOS (Google Sheets & Local CSV Fallback) ---
+def init_db():
+    try:
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        if "gcp_service_account" in st.secrets:
+            creds = ServiceAccountCredentials.from_json_keyfile_dict(st.secrets["gcp_service_account"], scope)
+            client = gspread.authorize(creds)
+            sheet = client.open("AquaRuta_DB").sheet1
+            return sheet
+    except Exception:
+        pass
+    return None
+
+sheet = init_db()
+DB_LOCAL = "aquaruta_db.csv"
+
+def obtener_datos():
+    if sheet:
+        try:
+            records = sheet.get_all_records()
+            if records:
+                return pd.DataFrame(records)
+        except:
+            pass
+    if os.path.exists(DB_LOCAL):
+        return pd.read_csv(DB_LOCAL)
+    return pd.DataFrame(columns=["Lat", "Lon", "Nivel", "Radio", "Fecha"])
+
+def guardar_dato(lat, lon, nivel, radio, fecha):
+    nuevo = {"Lat": lat, "Lon": lon, "Nivel": nivel, "Radio": radio, "Fecha": fecha}
+    if sheet:
+        try:
+            if len(sheet.get_all_values()) == 0:
+                sheet.append_row(["Lat", "Lon", "Nivel", "Radio", "Fecha"])
+            sheet.append_row([lat, lon, nivel, radio, fecha])
+        except:
+            pass
+    
+    df = obtener_datos()
+    df = pd.concat([df, pd.DataFrame([nuevo])], ignore_index=True)
+    df.to_csv(DB_LOCAL, index=False)
+
+def limpiar_datos():
+    if sheet:
+        try:
+            sheet.clear()
+            sheet.append_row(["Lat", "Lon", "Nivel", "Radio", "Fecha"])
+        except:
+            pass
+    if os.path.exists(DB_LOCAL):
+        os.remove(DB_LOCAL)
+
+# --- APIS ---
 @st.cache_data(ttl=300)
 def get_weather():
     url = "https://api.open-meteo.com/v1/forecast?latitude=-41.4693&longitude=-72.9424&current=precipitation&timezone=America/Santiago"
@@ -26,7 +82,7 @@ def get_calles_overpass(lat, lon, radio):
     way(around:{radio},{lat},{lon})["highway"~"primary|secondary|tertiary|residential|unclassified"];
     out geom;
     """
-    headers = {'User-Agent': 'AquaRuta-Prototipo-USS/1.0'}
+    headers = {'User-Agent': 'AquaRuta-Prototipo/1.0'}
     try:
         res = requests.get(overpass_url, params={'data': query}, headers=headers, timeout=10)
         if res.status_code == 200:
@@ -35,13 +91,12 @@ def get_calles_overpass(lat, lon, radio):
         pass
     return None
 
-if "reportes" not in st.session_state:
-    st.session_state.reportes = pd.DataFrame(columns=["Lat", "Lon", "Nivel", "Radio", "Fecha"])
-
+# --- APP ---
 def main():
     st.title("💧 AquaRuta")
     
     lluvia = get_weather()
+    reportes_df = obtener_datos()
     
     col1, col2 = st.columns([3, 1])
     
@@ -49,8 +104,8 @@ def main():
         m = folium.Map(location=[-41.4693, -72.9424], zoom_start=14, tiles="cartodbpositron")
         colores = {"Inundado": "#d32f2f", "Precaución": "#f57c00", "Transitable": "#388e3c"}
         
-        if not st.session_state.reportes.empty:
-            for _, row in st.session_state.reportes.iterrows():
+        if not reportes_df.empty:
+            for _, row in reportes_df.iterrows():
                 datos_calles = get_calles_overpass(row["Lat"], row["Lon"], row["Radio"])
                 
                 calles_dibujadas = False
@@ -82,13 +137,19 @@ def main():
     
     with col2:
         st.metric(label="Precipitación Actual (Open-Meteo)", value=f"{lluvia} mm")
+        
+        if sheet is None:
+            st.warning("Google Sheets no conectado (Faltan secrets). Usando CSV local para que funcione.")
+        else:
+            st.success("Google Sheets conectado.")
+
         st.markdown("### Reportar Calles")
         
         lat, lon = -41.4693, -72.9424
         if mapa and mapa.get("last_clicked"):
             lat = mapa["last_clicked"]["lat"]
             lon = mapa["last_clicked"]["lng"]
-            st.success(f"Coordenadas: {lat:.4f}, {lon:.4f}")
+            st.info(f"Coordenadas: {lat:.4f}, {lon:.4f}")
         else:
             st.info("Haz clic en el mapa para marcar el centro de la zona.")
         
@@ -98,21 +159,14 @@ def main():
             
             if st.form_submit_button("Marcar Calles"):
                 if mapa and mapa.get("last_clicked"):
-                    nuevo = pd.DataFrame([{
-                        "Lat": lat,
-                        "Lon": lon,
-                        "Nivel": estado,
-                        "Radio": radio,
-                        "Fecha": datetime.now().strftime("%H:%M:%S")
-                    }])
-                    if not nuevo.empty:
-                        st.session_state.reportes = pd.concat([st.session_state.reportes, nuevo], ignore_index=True)
-                        st.rerun()
+                    fecha_actual = datetime.now().strftime("%H:%M:%S")
+                    guardar_dato(lat, lon, estado, radio, fecha_actual)
+                    st.rerun()
                 else:
                     st.error("Por favor, haz clic en el mapa primero.")
                 
-        if st.button("Limpiar Mapa"):
-            st.session_state.reportes = pd.DataFrame(columns=["Lat", "Lon", "Nivel", "Radio", "Fecha"])
+        if st.button("Limpiar Base de Datos"):
+            limpiar_datos()
             st.rerun()
 
 if __name__ == "__main__":
