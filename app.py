@@ -1,66 +1,58 @@
 import streamlit as st
 import pandas as pd
 import folium
+from folium.plugins import Draw
 from streamlit_folium import st_folium
 import requests
 from datetime import datetime
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+import json
+import sqlite3
 import os
 
 st.set_page_config(page_title="AquaRuta - Puerto Montt", layout="wide")
 
-# --- BASE DE DATOS (Google Sheets & Local CSV Fallback) ---
-def init_db():
-    try:
-        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        if "gcp_service_account" in st.secrets:
-            creds = ServiceAccountCredentials.from_json_keyfile_dict(st.secrets["gcp_service_account"], scope)
-            client = gspread.authorize(creds)
-            sheet = client.open("AquaRuta_DB").sheet1
-            return sheet
-    except Exception:
-        pass
-    return None
+# --- BASE DE DATOS (SQLite Nivel Local/Producción) ---
+DB_FILE = "aquaruta_db.sqlite"
 
-sheet = init_db()
-DB_LOCAL = "aquaruta_db.csv"
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS reportes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lat REAL,
+            lon REAL,
+            nivel TEXT,
+            radio INTEGER,
+            fecha TEXT,
+            geojson TEXT
+        )
+    ''')
+    conn.commit()
+    return conn
 
 def obtener_datos():
-    if sheet:
-        try:
-            records = sheet.get_all_records()
-            if records:
-                return pd.DataFrame(records)
-        except:
-            pass
-    if os.path.exists(DB_LOCAL):
-        return pd.read_csv(DB_LOCAL)
-    return pd.DataFrame(columns=["Lat", "Lon", "Nivel", "Radio", "Fecha"])
+    conn = init_db()
+    df = pd.read_sql_query("SELECT * FROM reportes", conn)
+    conn.close()
+    return df
 
-def guardar_dato(lat, lon, nivel, radio, fecha):
-    nuevo = {"Lat": lat, "Lon": lon, "Nivel": nivel, "Radio": radio, "Fecha": fecha}
-    if sheet:
-        try:
-            if len(sheet.get_all_values()) == 0:
-                sheet.append_row(["Lat", "Lon", "Nivel", "Radio", "Fecha"])
-            sheet.append_row([lat, lon, nivel, radio, fecha])
-        except:
-            pass
-    
-    df = obtener_datos()
-    df = pd.concat([df, pd.DataFrame([nuevo])], ignore_index=True)
-    df.to_csv(DB_LOCAL, index=False)
+def guardar_dato(lat, lon, nivel, radio, fecha, geojson=None):
+    conn = init_db()
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO reportes (lat, lon, nivel, radio, fecha, geojson)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', (lat, lon, nivel, radio, fecha, geojson))
+    conn.commit()
+    conn.close()
 
 def limpiar_datos():
-    if sheet:
-        try:
-            sheet.clear()
-            sheet.append_row(["Lat", "Lon", "Nivel", "Radio", "Fecha"])
-        except:
-            pass
-    if os.path.exists(DB_LOCAL):
-        os.remove(DB_LOCAL)
+    conn = init_db()
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM reportes')
+    conn.commit()
+    conn.close()
 
 # --- APIS ---
 @st.cache_data(ttl=300)
@@ -74,23 +66,6 @@ def get_weather():
         return 0.0
     return 0.0
 
-@st.cache_data(ttl=600)
-def get_calles_overpass(lat, lon, radio):
-    overpass_url = "http://overpass-api.de/api/interpreter"
-    query = f"""
-    [out:json];
-    way(around:{radio},{lat},{lon})["highway"~"primary|secondary|tertiary|residential|unclassified"];
-    out geom;
-    """
-    headers = {'User-Agent': 'AquaRuta-Prototipo/1.0'}
-    try:
-        res = requests.get(overpass_url, params={'data': query}, headers=headers, timeout=10)
-        if res.status_code == 200:
-            return res.json()
-    except:
-        pass
-    return None
-
 # --- APP ---
 def main():
     st.title("💧 AquaRuta")
@@ -100,72 +75,92 @@ def main():
     
     col1, col2 = st.columns([3, 1])
     
+    colores = {"Inundado": "#d32f2f", "Precaución": "#f57c00", "Transitable": "#388e3c"}
+    
     with col1:
         m = folium.Map(location=[-41.4693, -72.9424], zoom_start=14, tiles="cartodbpositron")
-        colores = {"Inundado": "#d32f2f", "Precaución": "#f57c00", "Transitable": "#388e3c"}
+        
+        # Nuevo sistema de marcado: Herramientas de dibujo en el mapa
+        Draw(
+            export=False,
+            position="topleft",
+            draw_options={
+                "polyline": True,
+                "polygon": True,
+                "circle": True,
+                "marker": True,
+                "circlemarker": False,
+                "rectangle": True,
+            }
+        ).add_to(m)
         
         if not reportes_df.empty:
             for _, row in reportes_df.iterrows():
-                datos_calles = get_calles_overpass(row["Lat"], row["Lon"], row["Radio"])
+                color = colores.get(row["nivel"], "#000000")
+                tooltip_text = f"Estado: {row['nivel']} ({row['fecha']})"
                 
-                calles_dibujadas = False
-                if datos_calles and 'elements' in datos_calles:
-                    for element in datos_calles['elements']:
-                        if 'geometry' in element:
-                            puntos = [(pt['lat'], pt['lon']) for pt in element['geometry']]
-                            if puntos:
-                                folium.PolyLine(
-                                    puntos, 
-                                    color=colores[row["Nivel"]], 
-                                    weight=6, 
-                                    opacity=0.9,
-                                    tooltip=f"Estado: {row['Nivel']} ({row['Fecha']})"
-                                ).add_to(m)
-                                calles_dibujadas = True
-                
-                if not calles_dibujadas:
+                # Priorizar renderizado de zonas dibujadas a mano (polígonos/líneas)
+                if pd.notna(row["geojson"]) and row["geojson"]:
+                    try:
+                        geo_data = json.loads(row["geojson"])
+                        folium.GeoJson(
+                            geo_data,
+                            style_function=lambda x, color=color: {
+                                "fillColor": color,
+                                "color": color,
+                                "weight": 5,
+                                "fillOpacity": 0.6
+                            },
+                            tooltip=tooltip_text
+                        ).add_to(m)
+                    except json.JSONDecodeError:
+                        pass
+                # Fallback al antiguo sistema de círculos
+                elif pd.notna(row["lat"]) and pd.notna(row["lon"]):
                     folium.Circle(
-                        location=[row["Lat"], row["Lon"]],
-                        radius=int(row["Radio"]),
-                        color=colores[row["Nivel"]],
+                        location=[row["lat"], row["lon"]],
+                        radius=int(row["radio"]) if pd.notna(row["radio"]) else 150,
+                        color=color,
                         fill=True,
                         fill_opacity=0.4,
-                        tooltip=f"Estado: {row['Nivel']} ({row['Fecha']})"
+                        tooltip=tooltip_text
                     ).add_to(m)
-            
+        
         mapa = st_folium(m, width=900, height=600, key="mapa")
     
     with col2:
         st.metric(label="Precipitación Actual (Open-Meteo)", value=f"{lluvia} mm")
-        
-        if sheet is None:
-            st.warning("Google Sheets no conectado (Faltan secrets). Usando CSV local para que funcione.")
-        else:
-            st.success("Google Sheets conectado.")
+        st.success("Conectado a Base de Datos SQLite optimizada.")
 
-        st.markdown("### Reportar Calles")
+        st.markdown("### Reportar Calles / Zonas")
+        st.caption("Usa la barra de herramientas del mapa para dibujar una línea o área afectada, o haz clic en un punto central.")
         
-        lat, lon = -41.4693, -72.9424
-        if mapa and mapa.get("last_clicked"):
-            lat = mapa["last_clicked"]["lat"]
-            lon = mapa["last_clicked"]["lng"]
-            st.info(f"Coordenadas: {lat:.4f}, {lon:.4f}")
-        else:
-            st.info("Haz clic en el mapa para marcar el centro de la zona.")
+        lat, lon, geojson_str = None, None, None
+        
+        if mapa:
+            if mapa.get("last_active_drawing"):
+                geojson_str = json.dumps(mapa["last_active_drawing"])
+                st.info("✅ Zona o ruta dibujada registrada.")
+            elif mapa.get("last_clicked"):
+                lat = mapa["last_clicked"]["lat"]
+                lon = mapa["last_clicked"]["lng"]
+                st.info(f"📍 Punto único: {lat:.4f}, {lon:.4f}")
+            else:
+                st.info("Esperando selección en el mapa...")
         
         with st.form("form_reporte"):
             estado = st.select_slider("Severidad", options=["Transitable", "Precaución", "Inundado"])
-            radio = st.slider("Radio de búsqueda (metros)", 50, 400, 150)
+            radio = st.slider("Radio (Solo aplica si marcas un punto único)", 50, 400, 150)
             
-            if st.form_submit_button("Marcar Calles"):
-                if mapa and mapa.get("last_clicked"):
-                    fecha_actual = datetime.now().strftime("%H:%M:%S")
-                    guardar_dato(lat, lon, estado, radio, fecha_actual)
+            if st.form_submit_button("Guardar Registro"):
+                if geojson_str or (lat is not None and lon is not None):
+                    fecha_actual = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    guardar_dato(lat, lon, estado, radio, fecha_actual, geojson_str)
                     st.rerun()
                 else:
-                    st.error("Por favor, haz clic en el mapa primero.")
-                
-        if st.button("Limpiar Base de Datos"):
+                    st.error("Dibuja una zona o marca un punto en el mapa primero.")
+            
+        if st.button("Limpiar Base de Datos", type="primary", use_container_width=True):
             limpiar_datos()
             st.rerun()
 
