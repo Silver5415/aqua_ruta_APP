@@ -11,7 +11,6 @@ import os
 
 st.set_page_config(page_title="AquaRuta - Puerto Montt", layout="wide")
 
-# --- BASE DE DATOS (SQLite Nivel Local/Producción) ---
 DB_FILE = "aquaruta_db.sqlite"
 
 def init_db():
@@ -54,33 +53,38 @@ def limpiar_datos():
     conn.commit()
     conn.close()
 
-# --- APIS ---
 @st.cache_data(ttl=300)
 def get_weather():
-    url = "https://api.open-meteo.com/v1/forecast?latitude=-41.4693&longitude=-72.9424&current=precipitation&timezone=America/Santiago"
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude": -41.4693,
+        "longitude": -72.9424,
+        "current": "temperature_2m,precipitation,weather_code",
+        "hourly": "precipitation_probability,precipitation",
+        "daily": "precipitation_sum,precipitation_probability_max",
+        "timezone": "America/Santiago",
+        "models": "best_match" 
+    }
     try:
-        res = requests.get(url, timeout=5)
+        res = requests.get(url, params=params, timeout=5)
         if res.status_code == 200:
-            return res.json().get("current", {}).get("precipitation", 0.0)
+            return res.json()
     except:
-        return 0.0
-    return 0.0
+        return None
+    return None
 
-# --- APP ---
 def main():
     st.title("💧 AquaRuta")
     
-    lluvia = get_weather()
+    clima_data = get_weather()
     reportes_df = obtener_datos()
     
     col1, col2 = st.columns([3, 1])
-    
     colores = {"Inundado": "#d32f2f", "Precaución": "#f57c00", "Transitable": "#388e3c"}
     
     with col1:
         m = folium.Map(location=[-41.4693, -72.9424], zoom_start=14, tiles="cartodbpositron")
         
-        # Nuevo sistema de marcado: Herramientas de dibujo en el mapa
         Draw(
             export=False,
             position="topleft",
@@ -99,7 +103,6 @@ def main():
                 color = colores.get(row["nivel"], "#000000")
                 tooltip_text = f"Estado: {row['nivel']} ({row['fecha']})"
                 
-                # Priorizar renderizado de zonas dibujadas a mano (polígonos/líneas)
                 if pd.notna(row["geojson"]) and row["geojson"]:
                     try:
                         geo_data = json.loads(row["geojson"])
@@ -115,7 +118,6 @@ def main():
                         ).add_to(m)
                     except json.JSONDecodeError:
                         pass
-                # Fallback al antiguo sistema de círculos
                 elif pd.notna(row["lat"]) and pd.notna(row["lon"]):
                     folium.Circle(
                         location=[row["lat"], row["lon"]],
@@ -129,28 +131,47 @@ def main():
         mapa = st_folium(m, width=900, height=600, key="mapa")
     
     with col2:
-        st.metric(label="Precipitación Actual (Open-Meteo)", value=f"{lluvia} mm")
-        st.success("Conectado a Base de Datos SQLite optimizada.")
+        st.subheader("🌦️ Datos Meteorológicos")
+        if clima_data:
+            current = clima_data["current"]
+            daily = clima_data["daily"]
+            hourly = clima_data["hourly"]
+            
+            c1, c2 = st.columns(2)
+            c1.metric("Lluvia Actual", f"{current['precipitation']} mm")
+            c2.metric("Lluvia Diaria", f"{daily['precipitation_sum'][0]} mm")
+            
+            st.metric("Probabilidad Máx. Hoy", f"{daily['precipitation_probability_max'][0]}%")
+            
+            st.caption("Pronóstico de lluvia (Próximas 12h)")
+            hora_actual_idx = int(datetime.now().strftime("%H"))
+            df_hourly = pd.DataFrame({
+                "Hora": [f"{(hora_actual_idx + i) % 24}:00" for i in range(12)],
+                "Precipitación (mm)": hourly["precipitation"][hora_actual_idx:hora_actual_idx+12]
+            })
+            st.bar_chart(df_hourly.set_index("Hora"))
+        else:
+            st.warning("No se pudo conectar a la API meteorológica.")
 
+        st.markdown("---")
         st.markdown("### Reportar Calles / Zonas")
-        st.caption("Usa la barra de herramientas del mapa para dibujar una línea o área afectada, o haz clic en un punto central.")
         
         lat, lon, geojson_str = None, None, None
         
         if mapa:
             if mapa.get("last_active_drawing"):
                 geojson_str = json.dumps(mapa["last_active_drawing"])
-                st.info("✅ Zona o ruta dibujada registrada.")
+                st.info("✅ Zona/ruta registrada.")
             elif mapa.get("last_clicked"):
                 lat = mapa["last_clicked"]["lat"]
                 lon = mapa["last_clicked"]["lng"]
-                st.info(f"📍 Punto único: {lat:.4f}, {lon:.4f}")
+                st.info(f"📍 Punto: {lat:.4f}, {lon:.4f}")
             else:
-                st.info("Esperando selección en el mapa...")
+                st.info("Selecciona en el mapa...")
         
         with st.form("form_reporte"):
             estado = st.select_slider("Severidad", options=["Transitable", "Precaución", "Inundado"])
-            radio = st.slider("Radio (Solo aplica si marcas un punto único)", 50, 400, 150)
+            radio = st.slider("Radio (Solo punto único)", 50, 400, 150)
             
             if st.form_submit_button("Guardar Registro"):
                 if geojson_str or (lat is not None and lon is not None):
@@ -158,7 +179,7 @@ def main():
                     guardar_dato(lat, lon, estado, radio, fecha_actual, geojson_str)
                     st.rerun()
                 else:
-                    st.error("Dibuja una zona o marca un punto en el mapa primero.")
+                    st.error("Usa el mapa primero.")
             
         if st.button("Limpiar Base de Datos", type="primary", use_container_width=True):
             limpiar_datos()
