@@ -144,12 +144,18 @@ def main():
             st.metric("Probabilidad Máx. Hoy", f"{daily['precipitation_probability_max'][0]}%")
             
             st.caption("Pronóstico de lluvia (Próximas 12h)")
-            hora_actual_idx = int(datetime.now().strftime("%H"))
+            
             df_hourly = pd.DataFrame({
-                "Hora": [f"{(hora_actual_idx + i) % 24}:00" for i in range(12)],
-                "Precipitación (mm)": hourly["precipitation"][hora_actual_idx:hora_actual_idx+12]
+                "Tiempo": pd.to_datetime(hourly["time"]),
+                "Precipitación (mm)": hourly["precipitation"]
             })
-            st.bar_chart(df_hourly.set_index("Hora"))
+            
+            ahora_santiago = pd.Timestamp.utcnow().tz_convert("America/Santiago").tz_localize(None)
+            
+            df_futuro = df_hourly[df_hourly["Tiempo"] >= ahora_santiago].head(12).copy()
+            df_futuro["Hora"] = df_futuro["Tiempo"].dt.strftime("%H:00")
+            
+            st.bar_chart(df_futuro.set_index("Hora")["Precipitación (mm)"])
         else:
             st.warning("No se pudo conectar a la API meteorológica.")
 
