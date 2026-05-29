@@ -143,19 +143,28 @@ def main():
             
             st.metric("Probabilidad Máx. Hoy", f"{daily['precipitation_probability_max'][0]}%")
             
-            st.caption("Pronóstico de lluvia (Próximas 12h)")
+            st.caption("Pronóstico Extendido")
+            tab1, tab2 = st.tabs(["🌧️ 48 Horas", "📅 7 Días"])
             
-            df_hourly = pd.DataFrame({
-                "Tiempo": pd.to_datetime(hourly["time"]),
-                "Precipitación (mm)": hourly["precipitation"]
-            })
-            
-            ahora_santiago = pd.Timestamp.utcnow().tz_convert("America/Santiago").tz_localize(None)
-            
-            df_futuro = df_hourly[df_hourly["Tiempo"] >= ahora_santiago].head(12).copy()
-            df_futuro["Hora"] = df_futuro["Tiempo"].dt.strftime("%H:00")
-            
-            st.bar_chart(df_futuro.set_index("Hora")["Precipitación (mm)"])
+            with tab1:
+                df_hourly = pd.DataFrame({
+                    "Tiempo": pd.to_datetime(hourly["time"]),
+                    "Precipitación (mm)": hourly["precipitation"]
+                })
+                
+                ahora_santiago = pd.Timestamp.utcnow().tz_convert("America/Santiago").tz_localize(None).floor('h')
+                
+                df_futuro_48h = df_hourly[df_hourly["Tiempo"] >= ahora_santiago].head(48).copy()
+                df_futuro_48h["Hora"] = df_futuro_48h["Tiempo"].dt.strftime("%d/%m %H:00")
+                
+                st.area_chart(df_futuro_48h.set_index("Hora")["Precipitación (mm)"])
+                
+            with tab2:
+                df_daily = pd.DataFrame({
+                    "Día": pd.to_datetime(daily["time"]).dt.strftime("%d/%m"),
+                    "Lluvia Total (mm)": daily["precipitation_sum"]
+                })
+                st.bar_chart(df_daily.set_index("Día")["Lluvia Total (mm)"])
         else:
             st.warning("No se pudo conectar a la API meteorológica.")
 
